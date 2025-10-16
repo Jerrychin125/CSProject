@@ -27,16 +27,36 @@
 
 using namespace ns3;
 
-map<int, double> delay;
+std::map<int, Time> sendTimeMap;
+std::map<int, Time> recvTimeMap;
+std::map<int, double> delay;
 
 static void EchoTxRx (std::string context, const Ptr< const Packet > packet, const TcpHeader &header, const Ptr< const TcpSocketBase > socket)
 {
     // TODO: Calculate end-to-end delay
     // Hint1: Parse the packet (you may refer context.find())
+    int seq = header.GetSequenceNumber().GetValue();
+    Time now = Simulator::Now();
+
     // Hint2: Store send/arrival time for the same sequence number
-    std::cout << Simulator::Now () << ":" << context << ":" << packet->GetUid() << ":" << socket->GetNode () << ":" << header.GetSequenceNumber () << std::endl;
+    if (context.find("Tx") != std::string::npos) {
+        sendTimeMap[seq] = now;
+    }
+    if (context.find("Rx") != std::string::npos) {
+        recvTimeMap[seq] = now;
+    }
+    // std::cout << Simulator::Now () << ":" << context << ":" << packet->GetUid() << ":" << socket->GetNode () << ":" << header.GetSequenceNumber () << std::endl;
+
     // Hint3: Calculate end-to-end delay
-    delay[1] = 2.5; // This value is for reference only
+    if(sendTimeMap.count(seq) && recvTimeMap.count(seq)) {
+        Time delayTime = recvTimeMap[seq] - sendTimeMap[seq];
+        delay[seq] = delayTime.GetSeconds();
+        std::cout << "Seq " << seq << ": delay = " << delay[seq] << " s" << '\n';
+        // Clean Up
+        sendTimeMap.erase(seq);
+        recvTimeMap.erase(seq);
+    }
+    // delay[1] = 2.5; // This value is for reference only
 }
 
 void connect ()
@@ -122,7 +142,7 @@ int main (int argc, char *argv[])
 
     LeoChannelHelper utCh;
     utCh.SetConstellation (constellation);
-    utCh.SetGndDeviceAttribute("DataRate", StringValue("8kbps"));
+    utCh.SetGndDeviceAttribute("DataRate", StringValue("128kbps"));
     NetDeviceContainer utNet = utCh.Install (satellites, users);
 
     initial_position(satellites, 5);
@@ -196,13 +216,44 @@ int main (int argc, char *argv[])
     NS_LOG_INFO ("Done.");
 
     Ptr<PacketSink> sink1 = DynamicCast<PacketSink> (sinkApps.Get (0));
-    std::cout << users.Get (0)->GetId () << ":" << users.Get (1)->GetId () << ": " << sink1->GetTotalRx () << std::endl;
+    std::cout << "From " << users.Get (0)->GetId () << " to " << users.Get (1)->GetId () << ": " << sink1->GetTotalRx () << " transmissions." << std::endl;
 
+    Ptr<MobilityModel> txMobility = users.Get(0)->GetObject<MobilityModel>();
+    Ptr<MobilityModel> rxMobility = satellites.Get(0)->GetObject<MobilityModel>();
+    Ptr<PropagationLossModel> lossModel = CreateObject<LeoPropagationLossModel>();
+
+    double txPowerDbm = 50.0;
+    double rxPowerDbm = lossModel->CalcRxPower(txPowerDbm, txMobility, rxMobility);
+    // std::cout << "Calculated Rx Power = " << rxPowerDbm << " dBm\n";
+
+    double noiseDbm = -110.0;
+    double noiseWatt = pow(10.0, noiseDbm/10.0) / 1000.0;
+    double rxPowerWatt = pow(10.0, rxPowerDbm/10.0) / 1000.0;
+    double snrLinear = rxPowerWatt / noiseWatt;
+    double snrDb = 10 * log10(snrLinear);
+    double bandwidth = 128e3;
+    double capacitybps = bandwidth * log2(1.0 + snrLinear);
+
+    std::cout << "SNR = " << snrDb << " dB, Theoretical Capacity = " << capacitybps << " bps\n";
     // TODO: Output End-to-end Delay
-    double avg_delay = 0;
-    for(auto &[seq, t]: delay){
-        avg_delay += delay[seq];
-        cout << "Packet average end-to-end delay is " << avg_delay << "s" << endl;
+    // double avg_delay = 0;
+    // for(auto &[seq, t]: delay){
+    //     avg_delay += delay[seq];
+    //     cout << "Packet average end-to-end delay is " << avg_delay << "s" << endl;
+    // }
+
+    double total_delay = 0.0;
+    int count = 0;
+    for (auto &[seq, d]: delay) {
+        total_delay += d;
+        count ++;
+    }
+    if (count > 0) {
+        double avg_delay = total_delay / count;
+        std::cout << "Packet average end-to-end delay is " << avg_delay << " s" << '\n';
+    }
+    else {
+        std::cout << "No packets received to calculate delay.\n";
     }
 
     out.close ();
