@@ -26,7 +26,7 @@ For predictable LEO orbits, routing tables can be pre-calculated in advance for 
 ## Updates (from latest meeting)
 - [x] 根據 SNR 更新 data rate: 根據實測或模擬 SNR 結果動態調整鏈路 data rate（例如 C/N 對應 Modulation and Coding Scheme）。
 - [x] UAV to LEO 部分使用衛星通訊頻段計算 Data rate：將 UAV→衛星鏈路改為衛星通訊常見頻段（如 Ka、Ku、S 波段）並依頻段特性估算理論/實際 data rate。
-- [x] UAV 改成使用 beamforming 射向衛星：引入波束賦形（Beamforming/Hybrid Beamforming）方法提高 UAV 與衛星連線效率（參考世杰學長提供：https://ww2.mathworks.cn/help/phased/ug/introduction-to-hybrid-beamforming.html）。
+- [x] UAV 改成使用 beamforming 射向衛星：引入波束賦形（Beamforming/Hybrid Beamforming）方法提高 UAV 與衛星連線效率（參考世杰學長提供：[Introduction to Hybrid Beamforming](https://ww2.mathworks.cn/help/phased/ug/introduction-to-hybrid-beamforming.html)）。
 
 ## TODO
 - [ ] Implement flying vehicle communication simulation
