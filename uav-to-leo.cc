@@ -206,19 +206,12 @@ PrintLinkBudget (const SatBandParams &band, double distKm, double elevDeg)
     double snrDb = CalcSNR (band, distKm);
     double capacityMbps = CalcShannonCapacity (band, snrDb);
 
-    std::cerr << "\n[UPDATE-2] === Link Budget (" << band.name << ") ===" << std::endl;
-    std::cerr << "  Frequency:       " << band.freqGHz << " GHz" << std::endl;
-    std::cerr << "  Bandwidth:       " << band.bandwidthGHz * 1000.0 << " MHz" << std::endl;
-    std::cerr << "  EIRP:            " << band.eirpDbm << " dBm" << std::endl;
-    std::cerr << "  Slant range:     " << distKm << " km" << std::endl;
-    std::cerr << "  Elevation:       " << elevDeg << " deg" << std::endl;
-    std::cerr << "  FSPL:            " << fspl << " dB" << std::endl;
-    std::cerr << "  Atm loss:        " << band.atmLossDb << " dB" << std::endl;
-    std::cerr << "  Rx gain:         " << band.rxGainDbi << " dBi" << std::endl;
-    std::cerr << "  Link margin:     " << band.linkMarginDb << " dB" << std::endl;
-    std::cerr << "  SNR:             " << snrDb << " dB" << std::endl;
-    std::cerr << "  Shannon C:       " << capacityMbps << " Mbps" << std::endl;
-    std::cerr << "  ============================================" << std::endl;
+    std::cerr << "\n  Link Budget: " << band.name
+              << " | " << band.freqGHz << " GHz, BW=" << band.bandwidthGHz * 1000.0 << " MHz"
+              << " | EIRP=" << band.eirpDbm << " dBm, RxGain=" << band.rxGainDbi << " dBi"
+              << "\n               dist=" << distKm << " km, elev=" << elevDeg << " deg"
+              << " | FSPL=" << fspl << " dB, SNR=" << snrDb << " dB"
+              << " | Shannon=" << capacityMbps << " Mbps" << std::endl;
 }
 
 // ============================================================================
@@ -228,7 +221,6 @@ PrintLinkBudget (const SatBandParams &band, double distKm, double elevDeg)
 
 map<uint64_t, double> TxTimes;
 map<uint64_t, double> delay;
-uint64_t g_traceCallCount = 0;
 
 // ============================================================================
 // Trace callback: TCP Tx / Rx — identical to calculate-delay.cc
@@ -241,7 +233,6 @@ EchoTxRx (std::string context,
 {
     double time = Simulator::Now ().GetSeconds ();
     uint64_t uid = packet->GetUid ();
-    g_traceCallCount++;
 
     if (context.find ("/Tx") != std::string::npos)
     {
@@ -268,8 +259,6 @@ connect ()
                      MakeCallback (&EchoTxRx));
     Config::Connect ("/NodeList/*/$ns3::TcpL4Protocol/SocketList/*/Rx",
                      MakeCallback (&EchoTxRx));
-    std::cerr << "[TRACE] connect() executed at t="
-              << Simulator::Now ().GetSeconds () << "s" << std::endl;
 }
 
 // ============================================================================
@@ -322,7 +311,7 @@ ComputeElevationAngle (const Vector &gndEcef, const Vector &satEcef)
 // ============================================================================
 
 static uint32_t
-FindClosestSatellite (const NodeContainer &satellites, Ptr<Node> uavNode, int topN = 10)
+FindClosestSatellite (const NodeContainer &satellites, Ptr<Node> uavNode, int topN = 3)
 {
     Vector uavPos = uavNode->GetObject<MobilityModel> ()->GetPosition ();
     std::vector<std::pair<double, uint32_t>> distList;
@@ -332,34 +321,94 @@ FindClosestSatellite (const NodeContainer &satellites, Ptr<Node> uavNode, int to
         distList.push_back ({EcefDistance (uavPos, satPos), i});
     }
     std::sort (distList.begin (), distList.end ());
-    std::cerr << "\n=== Closest satellites to UAV at t="
-              << Simulator::Now ().GetSeconds () << "s ===" << std::endl;
+    std::cerr << "  Top-" << topN << " closest satellites:" << std::endl;
     int printed = 0;
     for (auto &[dist, idx] : distList)
     {
         if (printed >= topN) break;
         Vector satPos = satellites.Get (idx)->GetObject<MobilityModel> ()->GetPosition ();
-        double lat, lon, altKm;
-        EcefToGeo (satPos, lat, lon, altKm);
         double elev = ComputeElevationAngle (uavPos, satPos);
-        std::cerr << "  Sat[" << idx << "] dist=" << dist / 1000.0
-                  << " km, elev=" << elev << " deg, lat=" << lat << " lon=" << lon
-                  << ((elev >= 40.0) ? "  ** VISIBLE (>=40) **" :
-                     ((elev >= 20.0) ? "  * VISIBLE (>=20) *" : ""))
-                  << std::endl;
+        std::cerr << "    Sat[" << idx << "] dist="
+                  << std::fixed << std::setprecision(0)
+                  << dist / 1000.0 << " km, elev="
+                  << std::setprecision(1) << elev << " deg" << std::endl;
         printed++;
     }
     return distList[0].second;
 }
 
-static void
-PrintClosestSatellites (const NodeContainer &satellites, Ptr<Node> uavNode, int topN)
+// ============================================================================
+// [UPDATE-1] Adaptive data rate: periodically update DataRate based on SNR
+// ============================================================================
+// 每隔固定間隔重新計算 UAV↔target satellite 的即時斜距 → SNR → Shannon rate，
+// 並透過 MockNetDevice::SetDataRate() 動態更新 UAV device 的 data rate。
+//
+// 這模擬了 adaptive modulation & coding (AMC) 的效果：
+//   - 衛星靠近 (高仰角) → 低 FSPL → 高 SNR → 高 data rate
+//   - 衛星遠離 (低仰角) → 高 FSPL → 低 SNR → 低 data rate
+//   - 衛星低於仰角門檻  → link 斷開，data rate 設為最低值
+
+/// [UPDATE-1] 記錄每次 adaptive rate 更新的結果，供模擬結束後統計
+struct AdaptiveRateRecord
 {
-    FindClosestSatellite (satellites, uavNode, topN);
+    double timeSec;
+    double distKm;
+    double elevDeg;
+    double snrDb;
+    double rateMbps;
+};
+std::vector<AdaptiveRateRecord> g_rateLog;
+
+static void
+UpdateAdaptiveRate (Ptr<Node> uavNode,
+                    Ptr<Node> satNode,
+                    NetDeviceContainer utNet,
+                    SatBandParams band,
+                    uint32_t satIdx)
+{
+    Vector uavPos = uavNode->GetObject<MobilityModel> ()->GetPosition ();
+    Vector satPos = satNode->GetObject<MobilityModel> ()->GetPosition ();
+    double distKm = EcefDistance (uavPos, satPos) / 1000.0;
+    double elevDeg = ComputeElevationAngle (uavPos, satPos);
+
+    // 計算即時 SNR 和 Shannon rate
+    double snrDb = CalcSNR (band, distKm);
+    double rateMbps = CalcShannonCapacity (band, snrDb);
+
+    // 如果仰角低於門檻，link 不可用，設最低 rate
+    if (elevDeg < band.elevAngleDeg)
+    {
+        rateMbps = 0.001;  // 近乎 0，但避免除以零
+    }
+
+    // 轉成 DataRate 字串
+    std::ostringstream rateStr;
+    rateStr << std::fixed << std::setprecision(1) << rateMbps << "Mbps";
+
+    // 更新 UAV 的 GND device (utNet 的最後一個 device 是 UAV 的)
+    // LeoChannelHelper::Install(satellites, uavNodes) 的順序是：
+    //   先裝所有 satellite devices，最後裝 uavNodes 的 devices
+    // 所以 UAV 的 device index = utNet.GetN() - 1
+    uint32_t uavDevIdx = utNet.GetN () - 1;
+    Ptr<MockNetDevice> uavDev = DynamicCast<MockNetDevice> (utNet.Get (uavDevIdx));
+    if (uavDev)
+    {
+        uavDev->SetDataRate (DataRate (rateStr.str ()));
+    }
+
+    // 也更新 target satellite 的 device
+    Ptr<MockNetDevice> satDev = DynamicCast<MockNetDevice> (utNet.Get (satIdx));
+    if (satDev)
+    {
+        satDev->SetDataRate (DataRate (rateStr.str ()));
+    }
+
+    // 記錄到 g_rateLog（模擬結束後一次性輸出表格）
+    g_rateLog.push_back ({Simulator::Now ().GetSeconds (), distKm, elevDeg, snrDb, rateMbps});
 }
 
 // ============================================================================
-// Periodic monitoring helpers (unchanged)
+// Helper: print UAV position (used once at startup)
 // ============================================================================
 
 void
@@ -370,20 +419,6 @@ PrintUavPosition (Ptr<Node> uavNode)
     EcefToGeo (pos, lat, lon, altKm);
     std::cerr << "  UAV   lat=" << lat << " lon=" << lon
               << " alt=" << altKm * 1000.0 << " m" << std::endl;
-}
-
-void
-PrintUavSatDistance (Ptr<Node> uavNode, Ptr<Node> satNode, uint32_t satIdx)
-{
-    Vector uavPos = uavNode->GetObject<MobilityModel> ()->GetPosition ();
-    Vector satPos = satNode->GetObject<MobilityModel> ()->GetPosition ();
-    double dist = EcefDistance (uavPos, satPos);
-    double elev = ComputeElevationAngle (uavPos, satPos);
-    std::cerr << "  t=" << Simulator::Now ().GetSeconds ()
-              << "s  UAV <-> Sat[" << satIdx << "] dist="
-              << dist / 1000.0 << " km, elev=" << elev << " deg"
-              << ((elev >= 40.0) ? " [VISIBLE]" : " [below cutoff]")
-              << std::endl;
 }
 
 // ============================================================================
@@ -418,6 +453,9 @@ main (int argc, char *argv[])
     uint64_t ttlThresh   = 0;
     double   routeTimeout = 300.0;
 
+    // [UPDATE-1] Adaptive rate update interval (seconds)
+    double   rateInterval = 10.0;
+
     bool pcap = false;
 
     // ========================================================================
@@ -438,6 +476,7 @@ main (int argc, char *argv[])
     cmd.AddValue ("sendSize",        "TCP segment size (bytes)",               sendSize);
     cmd.AddValue ("ttlThresh",       "AODV TTL threshold",                     ttlThresh);
     cmd.AddValue ("routeTimeout",    "AODV ActiveRouteTimeout (seconds)",      routeTimeout);
+    cmd.AddValue ("rateInterval",    "Adaptive rate update interval (seconds)", rateInterval);
     cmd.AddValue ("destOnly",        "ns3::aodv::RoutingProtocol::DestinationOnly");
     cmd.AddValue ("pcap",            "Enable PCAP packet capture",             pcap);
     cmd.Parse (argc, argv);
@@ -457,9 +496,9 @@ main (int argc, char *argv[])
                   << "'. Using Ku-User." << std::endl;
         band = BAND_KU_USER;
     }
-    std::cerr << "[UPDATE-2] Selected band: " << band.name
-              << " (" << band.freqGHz << " GHz, BW="
-              << band.bandwidthGHz * 1000.0 << " MHz)" << std::endl;
+    std::cerr << "Band: " << band.name << " (" << band.freqGHz << " GHz, BW="
+              << band.bandwidthGHz * 1000.0 << " MHz, elev cutoff="
+              << band.elevAngleDeg << " deg)" << std::endl;
 
     // ========================================================================
     // 4. Redirect stdout (optional)
@@ -503,27 +542,23 @@ main (int argc, char *argv[])
     uavMobility.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
     uavMobility.Install (uavNodes);
 
-    std::cerr << "UAV ECEF: (" << uavEcef.x << ", "
-              << uavEcef.y << ", " << uavEcef.z << ")" << std::endl;
     PrintUavPosition (mainUav);
 
     // ========================================================================
     // 7. Auto-select closest satellite
     // ========================================================================
 
-    uint32_t autoClosest = FindClosestSatellite (satellites, mainUav, 10);
+    uint32_t autoClosest = FindClosestSatellite (satellites, mainUav, 3);
     if (targetSatIndex < 0)
     {
         targetSatIndex = (int32_t) autoClosest;
-        std::cerr << "\nAuto-selected target: Sat[" << targetSatIndex << "]" << std::endl;
     }
     else if ((uint32_t) targetSatIndex >= numSats)
     {
-        std::cerr << "WARNING: targetSatIndex out of range, using Sat["
-                  << autoClosest << "]" << std::endl;
         targetSatIndex = (int32_t) autoClosest;
     }
     Ptr<Node> targetSat = satellites.Get ((uint32_t) targetSatIndex);
+    std::cerr << "  Selected: Sat[" << targetSatIndex << "]" << std::endl;
 
     // ========================================================================
     // [UPDATE-2] 8. 計算 link budget 並設定 LEO channel
@@ -653,15 +688,18 @@ main (int argc, char *argv[])
     Simulator::Schedule (Seconds (1e-7), &connect);
 
     // ========================================================================
-    // 15. Periodic monitoring
+    // 15. Periodic monitoring — adaptive rate updates only
     // ========================================================================
+    // PrintUavSatDistance and PrintClosestSatellites removed to reduce clutter.
+    // All distance/elev/SNR/rate info is in the Adaptive Rate Log table.
 
-    for (int t = 0; t <= (int) duration; t += 30)
-        Simulator::Schedule (Seconds (t), &PrintUavSatDistance,
-                             mainUav, targetSat, (uint32_t) targetSatIndex);
-    for (int t = 60; t <= (int) duration; t += 60)
-        Simulator::Schedule (Seconds (t), &PrintClosestSatellites,
-                             satellites, mainUav, 5);
+    // [UPDATE-1] 定期更新 adaptive data rate
+    for (double t = rateInterval; t <= duration; t += rateInterval)
+    {
+        Simulator::Schedule (Seconds (t), &UpdateAdaptiveRate,
+                             mainUav, targetSat, utNet, band,
+                             (uint32_t) targetSatIndex);
+    }
 
     // ========================================================================
     // 16. PCAP (optional)
@@ -678,16 +716,10 @@ main (int argc, char *argv[])
     // 17. Run simulation
     // ========================================================================
 
-    std::cerr << "\n=== Starting simulation ==="
-              << "\n  Duration:      " << duration << "s"
-              << "\n  MaxBytes:      " << maxBytes
-              << "\n  Band:          " << band.name
-              << " (" << band.freqGHz << " GHz)"
-              << "\n  Data rate:     " << dataRateStr.str ()
-              << "\n  Target:        Sat[" << targetSatIndex << "] IP=" << targetAddr
-              << "\n  UAV:           (" << uavLatDeg << "N, " << uavLonDeg << "E, "
-              << uavAltM << "m)"
-              << "\n=========================" << std::endl;
+    std::cerr << "\n=== Simulation: " << duration << "s, "
+              << band.name << ", rate=" << dataRateStr.str ()
+              << ", Sat[" << targetSatIndex << "], "
+              << "adaptive interval=" << rateInterval << "s ===" << std::endl;
 
     NS_LOG_INFO ("Run Simulation.");
     Simulator::Stop (Seconds (duration));
@@ -703,57 +735,70 @@ main (int argc, char *argv[])
     uint64_t totalRx = pktSink->GetTotalRx ();
 
     std::cout << "\n========== UAV-to-LEO Simulation Results ==========" << std::endl;
-    std::cout << "UAV node:       " << mainUav->GetId () << std::endl;
-    std::cout << "Target Sat[" << targetSatIndex << "]: node "
+    std::cout << "UAV node " << mainUav->GetId ()
+              << " -> Sat[" << targetSatIndex << "] node "
               << targetSat->GetId () << " (IP " << targetAddr << ")" << std::endl;
+    std::cout << "Band:           " << band.name
+              << " (" << band.freqGHz << " GHz, BW=" << band.bandwidthGHz * 1000.0 << " MHz)" << std::endl;
 
-    // [UPDATE-2] 印出頻段與 link budget 結果
-    std::cout << "Band:           " << band.name << " (" << band.freqGHz << " GHz)" << std::endl;
-    std::cout << "Bandwidth:      " << band.bandwidthGHz * 1000.0 << " MHz" << std::endl;
-    std::cout << "Init distance:  " << initDistKm << " km" << std::endl;
-    std::cout << "Init elevation: " << initElevDeg << " deg" << std::endl;
-    std::cout << "FSPL:           " << fsplDb << " dB" << std::endl;
-    std::cout << "SNR:            " << snrDb << " dB" << std::endl;
-    std::cout << "Shannon rate:   " << shannonMbps << " Mbps" << std::endl;
-    std::cout << "NS-3 data rate: " << dataRateStr.str () << std::endl;
+    // *** Highlight: this is the parameter that decides LINK DOWN ***
+    // It comes from SatBandParams::elevAngleDeg, which is set per frequency band.
+    // - Ku-User:    40 deg  (from Telesat user link spec)
+    // - Ka-Gateway: 20 deg  (from Telesat gateway link spec)
+    // - Ka-User:    30 deg  (estimated for UAV Ka terminal)
+    // - S-band:     20 deg  (typical for S-band links)
+    // The LEO module's LeoPropagationLossModel also enforces this via its
+    // "ElevationAngle" attribute (set by SetConstellation), which drops packets
+    // when the satellite is below this angle from the ground node's horizon.
+    std::cout << "Elev cutoff:    " << band.elevAngleDeg
+              << " deg  <-- decides LINK DOWN (from " << band.name << " band spec)" << std::endl;
 
+    std::cout << "Init link:      dist=" << std::fixed << std::setprecision(1)
+              << initDistKm << " km, elev=" << initElevDeg
+              << " deg, FSPL=" << fsplDb << " dB, SNR=" << snrDb
+              << " dB, rate=" << shannonMbps << " Mbps" << std::endl;
     std::cout << "Duration:       " << duration << " s" << std::endl;
-    std::cout << "Bytes requested:" << maxBytes << std::endl;
-    std::cout << "Bytes received: " << totalRx << std::endl;
+    std::cout << "Bytes:          " << totalRx << " / " << maxBytes << " received" << std::endl;
 
     if (duration > 0)
     {
-        double throughputKbps = (totalRx * 8.0) / (duration * 1e3);
-        double throughputMbps = throughputKbps / 1e3;
-        std::cout << "Avg throughput: " << throughputKbps << " kbps ("
-                  << throughputMbps << " Mbps)" << std::endl;
+        double throughputMbps = (totalRx * 8.0) / (duration * 1e6);
+        std::cout << "Avg throughput: " << throughputMbps << " Mbps" << std::endl;
     }
-
-    // Debug diagnostics
-    std::cerr << "\n[DEBUG] EchoTxRx called " << g_traceCallCount << " times" << std::endl;
-    std::cerr << "[DEBUG] TxTimes entries: " << TxTimes.size () << std::endl;
-    std::cerr << "[DEBUG] delay entries:   " << delay.size () << std::endl;
 
     if (!delay.empty ())
     {
         double totalDelay = 0.0, minDelay = 1e9, maxDelay = 0.0, nums = 0;
         for (auto &[uid, d] : delay)
         {
-            totalDelay += d;
-            nums += 1;
+            totalDelay += d; nums += 1;
             if (d < minDelay) minDelay = d;
             if (d > maxDelay) maxDelay = d;
         }
-        double avgDelay = totalDelay / nums;
-        std::cout << "Packets measured:  " << (int) nums << std::endl;
-        std::cout << "Avg delay:         " << avgDelay * 1000.0 << " ms" << std::endl;
-        std::cout << "Min delay:         " << minDelay * 1000.0 << " ms" << std::endl;
-        std::cout << "Max delay:         " << maxDelay * 1000.0 << " ms" << std::endl;
-        cout << "Packet average end-to-end delay is " << avgDelay << "s" << endl;
+        std::cout << "Delay:          avg=" << (totalDelay / nums) * 1000.0
+                  << " ms, min=" << minDelay * 1000.0
+                  << " ms, max=" << maxDelay * 1000.0
+                  << " ms (" << (int) nums << " pkts)" << std::endl;
     }
-    else
+
+    // [UPDATE-1] Adaptive Rate Log — single compact table
+    if (!g_rateLog.empty ())
     {
-        std::cout << "\nWARNING: No delay measurements collected." << std::endl;
+        std::cout << "\n--- Adaptive Rate Log (interval=" << rateInterval << "s) ---" << std::endl;
+        std::cout << "  Time   Dist(km)   Elev    SNR    Rate(Mbps)  Status" << std::endl;
+        for (auto &r : g_rateLog)
+        {
+            bool down = (r.elevDeg < band.elevAngleDeg);
+            std::cout << std::fixed << std::setprecision(1)
+                      << std::setw(6) << r.timeSec << "s"
+                      << std::setw(10) << r.distKm
+                      << std::setw(8) << r.elevDeg << "°"
+                      << std::setw(7) << r.snrDb << " dB"
+                      << std::setw(11) << r.rateMbps
+                      << "  " << (down ? "[DOWN <" : "[OK   >=")
+                      << band.elevAngleDeg << "°]"
+                      << std::endl;
+        }
     }
     std::cout << "=====================================================" << std::endl;
 
