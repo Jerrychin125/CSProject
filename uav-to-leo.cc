@@ -2,46 +2,20 @@
 /*
  * uav-to-leo.cc
  *
- * Step 2: Establish a DIRECT communication link between the main UAV
- * (cluster head) and a LEO satellite for large-volume data transmission.
+ * Step 2: Direct UAV (cluster head) → LEO satellite data transmission.
  *
- * Architecture:
- *
- *   [UAV Cluster Head]  ── LEO channel (uplink) ──>  [LEO Satellite]
- *        (sender)                                       (receiver)
- *        GND device                                     SAT device
- *        BulkSend                                       PacketSink
- *
- * This is a single-hop scenario: the UAV sends data directly to whichever
- * LEO satellite is visible (within the elevation-angle cutoff).
- *
- * Key design decisions:
- *   - The UAV is treated as a "mobile ground station" by the ns-3-leo module.
- *     LeoMockChannel only permits GND <-> SAT transmission.
- *   - LeoPropagationLossModel handles FSPL, atmospheric loss, elevation-angle
- *     cutoff, and link margin — parameterized via SetConstellation().
- *   - TCP BulkSendApplication for reliable large-volume data transfer.
- *   - AODV with extended ActiveRouteTimeout for dynamic route discovery.
- *   - PacketSink is installed on ALL satellites so that whichever satellite
- *     enters the visibility window can receive data.
- *   - At startup, the simulation scans all satellites and automatically
- *     selects the closest one as the initial target.
- *
- * Reference files: calculate-delay.cc, uas-vanet.cc
- * Module:          ns-3-leo (LeoChannelHelper, LeoPropagationLossModel,
- *                  LeoMockChannel, LeoOrbitNodeHelper)
- *
- * Usage examples:
- *   ./waf --run "uav-to-leo"
- *   ./waf --run "uav-to-leo --duration=600 --maxBytes=0"
- *   ./waf --run "uav-to-leo --uavLat=24.8 --uavLon=121.0 --uavAlt=500"
- *   ./waf --run "uav-to-leo --constellation=TelesatGateway --pcap=true"
+ * [UPDATE-2] 新增：使用衛星通訊頻段（Ka / Ku band）計算 link budget，
+ *   透過 Shannon capacity 公式由 SNR 推導理論 data rate，
+ *   並用 SetConstellation() + public API 覆寫 DataRate 將計算結果設定到 LEO channel。
+ *   取代原本直接使用 preset 固定 data rate 的做法。
  */
 
 #include <iostream>
 #include <cmath>
 #include <map>
 #include <fstream>
+#include <iomanip>
+#include <string>
 #include <vector>
 #include <algorithm>
 
@@ -62,13 +36,205 @@ using namespace std;
 static const double EARTH_RADIUS = 6.37101e6;  // meters (same as LEO_PROP_EARTH_RAD)
 
 // ============================================================================
+// [UPDATE-2] Satellite frequency band parameters
+// ============================================================================
+// 衛星通訊常見頻段參數。每組包含完整的 link budget 所需數值。
+// 來源：del Portillo et al., MIT (leo-telesat-constants.h, leo-starlink-constants.h)
+//
+// 使用方式：透過 --band 命令列參數選擇頻段，程式會自動計算 FSPL、SNR、Shannon data rate。
+
+struct SatBandParams
+{
+    std::string name;          // 頻段名稱
+    double freqGHz;            // 載波頻率 (GHz)
+    double bandwidthGHz;       // 通道頻寬 (GHz)
+    double eirpDbm;            // 等效全向輻射功率 (dBm)
+    double rxGainDbi;          // 接收天線增益 (dBi)
+    double rxLossDb;           // 接收端損耗 (dB)
+    double atmLossDb;          // 大氣損耗 (dB)
+    double linkMarginDb;       // 鏈路餘量 (dB)
+    double systemTempK;        // 系統噪聲溫度 (K)
+    double elevAngleDeg;       // 最小仰角門檻 (deg)
+    double bfGainDb;           // [UPDATE-3] Beamforming gain (dB), 0 = no beamforming
+};
+
+// 預設頻段表
+static const SatBandParams BAND_KU_USER = {
+    "Ku-User",                 // Telesat user uplink
+    13.5,                      // freq: Ku-band 13.5 GHz
+    0.25,                      // BW: 250 MHz
+    64.6,                      // EIRP: 64.6 dBm
+    38.3,                      // Rx gain: 38.3 dBi
+    0.0,                       // Rx loss: 0 dB
+    0.41,                      // Atm loss: 0.41 dB
+    0.76,                      // Link margin: 0.76 dB
+    350.1,                     // System temp: 350.1 K
+    40.0,                      // Min elevation: 40 deg
+    0.0                        // [UPDATE-3] BF gain: 0 dB (no beamforming)
+};
+
+static const SatBandParams BAND_KA_GATEWAY = {
+    "Ka-Gateway",              // Telesat gateway uplink
+    28.5,                      // freq: Ka-band 28.5 GHz
+    2.1,                       // BW: 2100 MHz
+    105.9,                     // EIRP: 105.9 dBm
+    31.8,                      // Rx gain: 31.8 dBi
+    0.0,                       // Rx loss: 0 dB
+    4.8,                       // Atm loss: 4.8 dB
+    0.36,                      // Link margin: 0.36 dB
+    868.4,                     // System temp: 868.4 K
+    20.0,                      // Min elevation: 20 deg
+    0.0                        // [UPDATE-3] BF gain: 0 dB
+};
+
+static const SatBandParams BAND_KA_USER = {
+    "Ka-User",                 // Ka-band user terminal (hypothetical UAV terminal)
+    20.0,                      // freq: Ka-band downlink 20 GHz (可作 uplink 估算)
+    0.5,                       // BW: 500 MHz
+    70.0,                      // EIRP: 70 dBm (UAV 中型天線)
+    35.0,                      // Rx gain: 35 dBi
+    0.0,                       // Rx loss: 0 dB
+    2.0,                       // Atm loss: 2.0 dB
+    1.0,                       // Link margin: 1.0 dB
+    300.0,                     // System temp: 300 K
+    30.0,                      // Min elevation: 30 deg
+    0.0                        // [UPDATE-3] BF gain: 0 dB
+};
+
+static const SatBandParams BAND_S = {
+    "S-band",                  // S-band (低頻、低 data rate、高穿透力)
+    2.2,                       // freq: 2.2 GHz
+    0.02,                      // BW: 20 MHz
+    50.0,                      // EIRP: 50 dBm
+    25.0,                      // Rx gain: 25 dBi
+    0.0,                       // Rx loss: 0 dB
+    0.1,                       // Atm loss: 0.1 dB
+    0.5,                       // Link margin: 0.5 dB
+    290.0,                     // System temp: 290 K
+    20.0,                      // Min elevation: 20 deg
+    0.0                        // [UPDATE-3] BF gain: 0 dB
+};
+
+// ============================================================================
+// [UPDATE-2] Link budget calculation functions
+// ============================================================================
+
+/**
+ * \brief 計算自由空間路徑損耗 (FSPL)
+ *
+ * 公式: FSPL(dB) = 20*log10(d) + 20*log10(f) + 20*log10(4*pi/c)
+ *   d = 斜距 (m), f = 頻率 (Hz), c = 光速 (m/s)
+ *
+ * 等價於: FSPL(dB) = 32.45 + 20*log10(f_MHz) + 20*log10(d_km)
+ *
+ * \param distKm    UAV 到衛星的斜距 (km)
+ * \param freqGHz   載波頻率 (GHz)
+ * \return          FSPL (dB)
+ */
+static double
+CalcFSPL (double distKm, double freqGHz)
+{
+    // FSPL = 32.45 + 20*log10(f_MHz) + 20*log10(d_km)
+    double freqMHz = freqGHz * 1000.0;
+    return 32.45 + 20.0 * log10 (freqMHz) + 20.0 * log10 (distKm);
+}
+
+/**
+ * \brief 計算接收端 SNR
+ *
+ * Link budget:
+ *   Rx Power (dBm) = EIRP + bfGain - FSPL - atmLoss + rxGain - rxLoss - linkMargin
+ *   Noise (dBm)    = -228.6 (dBW/K/Hz) + 10*log10(T) + 10*log10(B_Hz) + 30
+ *   SNR (dB)       = Rx Power - Noise
+ *
+ * [UPDATE-3] bfGain 加在 EIRP 之後，等效提高發射功率。
+ *   Beamforming 將天線陣列的能量集中在衛星方向，效果等同於增加 EIRP。
+ *   bfGainDb = 10*log10(N)，N 為天線元素數（例如 4x4=16 → 12 dB）。
+ *
+ * \param band      頻段參數（含 bfGainDb）
+ * \param distKm    斜距 (km)
+ * \return          SNR (dB)
+ */
+static double
+CalcSNR (const SatBandParams &band, double distKm)
+{
+    double fspl = CalcFSPL (distKm, band.freqGHz);
+
+    // Received power (dBm)
+    // [UPDATE-3] bfGainDb 加在這裡，等效提高發射端的 EIRP
+    double rxPowerDbm = band.eirpDbm
+                        + band.bfGainDb     // [UPDATE-3] Beamforming gain
+                        - fspl
+                        - band.atmLossDb
+                        + band.rxGainDbi
+                        - band.rxLossDb
+                        - band.linkMarginDb;
+
+    // Noise power (dBm)
+    //   N = k * T * B  (Watts)
+    //   k = 1.38e-23 J/K (Boltzmann)
+    //   In dBm: N_dBm = -228.6 + 10*log10(T_K) + 10*log10(B_Hz) + 30
+    double bwHz = band.bandwidthGHz * 1e9;
+    double noiseDbm = -228.6 + 10.0 * log10 (band.systemTempK)
+                             + 10.0 * log10 (bwHz)
+                             + 30.0;  // dBW → dBm
+
+    return rxPowerDbm - noiseDbm;
+}
+
+/**
+ * \brief 由 SNR 計算 Shannon capacity (理論最大 data rate)
+ *
+ * 公式: C = B * log2(1 + SNR_linear)
+ *
+ * \param band      頻段參數 (取 bandwidthGHz)
+ * \param snrDb     SNR (dB)
+ * \return          Shannon capacity (Mbps)
+ */
+static double
+CalcShannonCapacity (const SatBandParams &band, double snrDb)
+{
+    double snrLinear = pow (10.0, snrDb / 10.0);
+    double bwHz = band.bandwidthGHz * 1e9;
+    double capacityBps = bwHz * log2 (1.0 + snrLinear);
+    return capacityBps / 1e6;  // → Mbps
+}
+
+/**
+ * \brief 完整 link budget 計算並印出結果
+ *
+ * 以 UAV 與衛星之間的斜距和所選頻段，計算 FSPL → SNR → Shannon data rate。
+ * 結果印到 cerr 供終端檢視。
+ *
+ * \param band      頻段參數
+ * \param distKm    斜距 (km)
+ * \param elevDeg   仰角 (deg)
+ */
+static void
+PrintLinkBudget (const SatBandParams &band, double distKm, double elevDeg)
+{
+    double fspl = CalcFSPL (distKm, band.freqGHz);
+    double snrDb = CalcSNR (band, distKm);
+    double capacityMbps = CalcShannonCapacity (band, snrDb);
+
+    std::cerr << "\n  Link Budget: " << band.name
+              << " | " << band.freqGHz << " GHz, BW=" << band.bandwidthGHz * 1000.0 << " MHz"
+              << " | EIRP=" << band.eirpDbm << " dBm"
+              << ((band.bfGainDb > 0) ? " + BF=" : "")
+              << ((band.bfGainDb > 0) ? std::to_string((int)band.bfGainDb) + " dB" : "")
+              << ", RxGain=" << band.rxGainDbi << " dBi"
+              << "\n               dist=" << distKm << " km, elev=" << elevDeg << " deg"
+              << " | FSPL=" << fspl << " dB, SNR=" << snrDb << " dB"
+              << " | Shannon=" << capacityMbps << " Mbps" << std::endl;
+}
+
+// ============================================================================
 // Global data structures for end-to-end delay measurement
 // ============================================================================
 // Same approach as calculate-delay.cc: match Tx and Rx by packet UID.
 
-map<uint64_t, double> TxTimes;  ///< Tx timestamp keyed by packet UID
-map<uint64_t, double> delay;    ///< End-to-end delay keyed by packet UID
-uint64_t g_traceCallCount = 0;  ///< Debug counter: how many times EchoTxRx was called
+map<uint64_t, double> TxTimes;
+map<uint64_t, double> delay;
 
 // ============================================================================
 // Trace callback: TCP Tx / Rx — identical to calculate-delay.cc
@@ -81,7 +247,6 @@ EchoTxRx (std::string context,
 {
     double time = Simulator::Now ().GetSeconds ();
     uint64_t uid = packet->GetUid ();
-    g_traceCallCount++;
 
     if (context.find ("/Tx") != std::string::npos)
     {
@@ -95,14 +260,12 @@ EchoTxRx (std::string context,
         }
     }
 
+    // Per-packet log (commented out to avoid flooding terminal)
     // std::cout << Simulator::Now () << ":" << context << ":" << uid
     //           << ":" << socket->GetNode ()
     //           << ":" << header.GetSequenceNumber () << std::endl;
 }
 
-// ============================================================================
-// Deferred trace connection — identical to calculate-delay.cc
-// ============================================================================
 void
 connect ()
 {
@@ -110,19 +273,12 @@ connect ()
                      MakeCallback (&EchoTxRx));
     Config::Connect ("/NodeList/*/$ns3::TcpL4Protocol/SocketList/*/Rx",
                      MakeCallback (&EchoTxRx));
-    // Debug: confirm this function actually ran
-    std::cerr << "[TRACE] connect() executed at t="
-              << Simulator::Now ().GetSeconds () << "s" << std::endl;
 }
 
 // ============================================================================
-// Coordinate conversion utilities
+// Coordinate conversion utilities (unchanged)
 // ============================================================================
 
-/**
- * \brief Geodetic (lat, lon, alt) -> ECEF.  Spherical Earth model.
- *        Uses same radius constant as LeoPropagationLossModel.
- */
 static Vector
 GeoToEcef (double latDeg, double lonDeg, double altM)
 {
@@ -134,9 +290,6 @@ GeoToEcef (double latDeg, double lonDeg, double altM)
                    R * sin (latRad));
 }
 
-/**
- * \brief ECEF -> geodetic (lat deg, lon deg, alt km) for display.
- */
 static void
 EcefToGeo (const Vector &ecef, double &latDeg, double &lonDeg, double &altKm)
 {
@@ -146,143 +299,131 @@ EcefToGeo (const Vector &ecef, double &latDeg, double &lonDeg, double &altKm)
     altKm  = (r - EARTH_RADIUS) / 1000.0;
 }
 
-/**
- * \brief Euclidean distance between two ECEF positions (meters).
- */
 static double
 EcefDistance (const Vector &a, const Vector &b)
 {
-    double dx = a.x - b.x;
-    double dy = a.y - b.y;
-    double dz = a.z - b.z;
+    double dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
     return sqrt (dx * dx + dy * dy + dz * dz);
 }
 
-/**
- * \brief Compute elevation angle (degrees) from a ground point to a satellite.
- *
- * The elevation angle is the angle above the local horizon at the ground
- * point.  The LEO module's propagation loss model drops packets when this
- * angle is below the configured cutoff (e.g., 40 deg for TelesatUser).
- *
- * \param gndEcef  Ground point ECEF position
- * \param satEcef  Satellite ECEF position
- * \return         Elevation angle in degrees (0 = horizon, 90 = zenith)
- */
 static double
 ComputeElevationAngle (const Vector &gndEcef, const Vector &satEcef)
 {
-    // Vector from ground to satellite
     double dx = satEcef.x - gndEcef.x;
     double dy = satEcef.y - gndEcef.y;
     double dz = satEcef.z - gndEcef.z;
     double slantRange = sqrt (dx * dx + dy * dy + dz * dz);
-
-    if (slantRange < 1.0) return 90.0;  // coincident points
-
-    // Ground point unit normal (points radially outward from Earth center)
-    double gndR = sqrt (gndEcef.x * gndEcef.x +
-                        gndEcef.y * gndEcef.y +
-                        gndEcef.z * gndEcef.z);
-    double nx = gndEcef.x / gndR;
-    double ny = gndEcef.y / gndR;
-    double nz = gndEcef.z / gndR;
-
-    // Dot product of ground-to-sat vector with the surface normal
+    if (slantRange < 1.0) return 90.0;
+    double gndR = sqrt (gndEcef.x * gndEcef.x + gndEcef.y * gndEcef.y + gndEcef.z * gndEcef.z);
+    double nx = gndEcef.x / gndR, ny = gndEcef.y / gndR, nz = gndEcef.z / gndR;
     double dot = (dx * nx + dy * ny + dz * nz) / slantRange;
-
-    // Elevation = 90 - zenith angle = 90 - acos(dot)
-    // Equivalently: elevation = asin(dot)
-    double elevRad = asin (std::max (-1.0, std::min (1.0, dot)));
-    return elevRad * 180.0 / M_PI;
+    return asin (std::max (-1.0, std::min (1.0, dot))) * 180.0 / M_PI;
 }
 
 // ============================================================================
-// Find the closest satellite to the UAV
+// Satellite selection (unchanged)
 // ============================================================================
-/**
- * \brief Scans all satellites and returns the index of the one closest to
- *        the UAV at the current simulation time.  Also prints the top-N
- *        closest satellites with their distances and elevation angles.
- *
- * \param satellites  NodeContainer of all satellites
- * \param uavNode     The UAV node
- * \param topN        Number of top candidates to print
- * \return            Index of the closest satellite
- */
+
 static uint32_t
-FindClosestSatellite (const NodeContainer &satellites,
-                      Ptr<Node> uavNode,
-                      int topN = 10)
+FindClosestSatellite (const NodeContainer &satellites, Ptr<Node> uavNode, int topN = 3)
 {
     Vector uavPos = uavNode->GetObject<MobilityModel> ()->GetPosition ();
-    uint32_t numSats = satellites.GetN ();
-
-    // Build a list of (distance, index) pairs
     std::vector<std::pair<double, uint32_t>> distList;
-    for (uint32_t i = 0; i < numSats; i++)
+    for (uint32_t i = 0; i < satellites.GetN (); i++)
     {
         Vector satPos = satellites.Get (i)->GetObject<MobilityModel> ()->GetPosition ();
-        double dist = EcefDistance (uavPos, satPos);
-        distList.push_back (std::make_pair (dist, i));
+        distList.push_back ({EcefDistance (uavPos, satPos), i});
     }
-
-    // Sort by distance (ascending)
     std::sort (distList.begin (), distList.end ());
-
-    // Print the top-N closest satellites
-    std::cerr << "\n=== Closest satellites to UAV at t="
-              << Simulator::Now ().GetSeconds () << "s ===" << std::endl;
+    std::cerr << "  Top-" << topN << " closest satellites:" << std::endl;
     int printed = 0;
     for (auto &[dist, idx] : distList)
     {
         if (printed >= topN) break;
         Vector satPos = satellites.Get (idx)->GetObject<MobilityModel> ()->GetPosition ();
-        double lat, lon, altKm;
-        EcefToGeo (satPos, lat, lon, altKm);
         double elev = ComputeElevationAngle (uavPos, satPos);
-        std::cerr << "  Sat[" << idx << "] dist=" << dist / 1000.0
-                  << " km, elev=" << elev << " deg"
-                  << ", lat=" << lat << " lon=" << lon
-                  << ((elev >= 40.0) ? "  ** VISIBLE (>=40 deg) **" :
-                     ((elev >= 20.0) ? "  * VISIBLE (>=20 deg) *" : ""))
-                  << std::endl;
+        std::cerr << "    Sat[" << idx << "] dist="
+                  << std::fixed << std::setprecision(0)
+                  << dist / 1000.0 << " km, elev="
+                  << std::setprecision(1) << elev << " deg" << std::endl;
         printed++;
     }
-
-    return distList[0].second;  // index of the closest satellite
+    return distList[0].second;
 }
 
 // ============================================================================
-// Void wrapper for FindClosestSatellite (Simulator::Schedule needs void return)
+// [UPDATE-1] Adaptive data rate: periodically update DataRate based on SNR
 // ============================================================================
+// 每隔固定間隔重新計算 UAV↔target satellite 的即時斜距 → SNR → Shannon rate，
+// 並透過 MockNetDevice::SetDataRate() 動態更新 UAV device 的 data rate。
+//
+// 這模擬了 adaptive modulation & coding (AMC) 的效果：
+//   - 衛星靠近 (高仰角) → 低 FSPL → 高 SNR → 高 data rate
+//   - 衛星遠離 (低仰角) → 高 FSPL → 低 SNR → 低 data rate
+//   - 衛星低於仰角門檻  → link 斷開，data rate 設為最低值
+
+/// [UPDATE-1] 記錄每次 adaptive rate 更新的結果，供模擬結束後統計
+struct AdaptiveRateRecord
+{
+    double timeSec;
+    double distKm;
+    double elevDeg;
+    double snrDb;
+    double rateMbps;
+};
+std::vector<AdaptiveRateRecord> g_rateLog;
+
 static void
-PrintClosestSatellites (const NodeContainer &satellites,
-                        Ptr<Node> uavNode,
-                        int topN)
+UpdateAdaptiveRate (Ptr<Node> uavNode,
+                    Ptr<Node> satNode,
+                    NetDeviceContainer utNet,
+                    SatBandParams band,
+                    uint32_t satIdx)
 {
-    FindClosestSatellite (satellites, uavNode, topN);
-}
+    Vector uavPos = uavNode->GetObject<MobilityModel> ()->GetPosition ();
+    Vector satPos = satNode->GetObject<MobilityModel> ()->GetPosition ();
+    double distKm = EcefDistance (uavPos, satPos) / 1000.0;
+    double elevDeg = ComputeElevationAngle (uavPos, satPos);
 
-// ============================================================================
-// Periodic monitoring helpers
-// ============================================================================
+    // 計算即時 SNR 和 Shannon rate
+    double snrDb = CalcSNR (band, distKm);
+    double rateMbps = CalcShannonCapacity (band, snrDb);
 
-void
-PrintSatellitePositions (const NodeContainer &satellites, int maxPrint)
-{
-    std::cerr << "=== Satellite positions at t="
-              << Simulator::Now ().GetSeconds () << "s ===" << std::endl;
-    for (int i = 0; i < min ((int) satellites.GetN (), maxPrint); i++)
+    // 如果仰角低於門檻，link 不可用，設最低 rate
+    if (elevDeg < band.elevAngleDeg)
     {
-        Vector pos = satellites.Get (i)->GetObject<MobilityModel> ()->GetPosition ();
-        double lat, lon, altKm;
-        EcefToGeo (pos, lat, lon, altKm);
-        std::cerr << "  Sat[" << i << "] lat=" << lat
-                  << " lon=" << lon
-                  << " alt=" << altKm << " km" << std::endl;
+        rateMbps = 0.001;  // 近乎 0，但避免除以零
     }
+
+    // 轉成 DataRate 字串
+    std::ostringstream rateStr;
+    rateStr << std::fixed << std::setprecision(1) << rateMbps << "Mbps";
+
+    // 更新 UAV 的 GND device (utNet 的最後一個 device 是 UAV 的)
+    // LeoChannelHelper::Install(satellites, uavNodes) 的順序是：
+    //   先裝所有 satellite devices，最後裝 uavNodes 的 devices
+    // 所以 UAV 的 device index = utNet.GetN() - 1
+    uint32_t uavDevIdx = utNet.GetN () - 1;
+    Ptr<MockNetDevice> uavDev = DynamicCast<MockNetDevice> (utNet.Get (uavDevIdx));
+    if (uavDev)
+    {
+        uavDev->SetDataRate (DataRate (rateStr.str ()));
+    }
+
+    // 也更新 target satellite 的 device
+    Ptr<MockNetDevice> satDev = DynamicCast<MockNetDevice> (utNet.Get (satIdx));
+    if (satDev)
+    {
+        satDev->SetDataRate (DataRate (rateStr.str ()));
+    }
+
+    // 記錄到 g_rateLog（模擬結束後一次性輸出表格）
+    g_rateLog.push_back ({Simulator::Now ().GetSeconds (), distKm, elevDeg, snrDb, rateMbps});
 }
+
+// ============================================================================
+// Helper: print UAV position (used once at startup)
+// ============================================================================
 
 void
 PrintUavPosition (Ptr<Node> uavNode)
@@ -290,23 +431,8 @@ PrintUavPosition (Ptr<Node> uavNode)
     Vector pos = uavNode->GetObject<MobilityModel> ()->GetPosition ();
     double lat, lon, altKm;
     EcefToGeo (pos, lat, lon, altKm);
-    std::cerr << "  UAV   lat=" << lat
-              << " lon=" << lon
+    std::cerr << "  UAV   lat=" << lat << " lon=" << lon
               << " alt=" << altKm * 1000.0 << " m" << std::endl;
-}
-
-void
-PrintUavSatDistance (Ptr<Node> uavNode, Ptr<Node> satNode, uint32_t satIdx)
-{
-    Vector uavPos = uavNode->GetObject<MobilityModel> ()->GetPosition ();
-    Vector satPos = satNode->GetObject<MobilityModel> ()->GetPosition ();
-    double dist = EcefDistance (uavPos, satPos);
-    double elev = ComputeElevationAngle (uavPos, satPos);
-    std::cerr << "  t=" << Simulator::Now ().GetSeconds ()
-              << "s  UAV <-> Sat[" << satIdx << "] dist="
-              << dist / 1000.0 << " km, elev=" << elev << " deg"
-              << ((elev >= 40.0) ? " [VISIBLE]" : " [below cutoff]")
-              << std::endl;
 }
 
 // ============================================================================
@@ -323,29 +449,32 @@ main (int argc, char *argv[])
     std::string orbitFile;
     std::string traceFile;
 
-    // UAV position — default: Hsinchu, Taiwan
     double uavLatDeg  = 24.80;
     double uavLonDeg  = 120.97;
     double uavAltM    = 300.0;
 
-    // Constellation preset
-    std::string constellation = "TelesatUser";
+    // [UPDATE-2] 新增 --band 參數，取代原本的 --constellation
+    // 可選: "Ku-User", "Ka-Gateway", "Ka-User", "S-band"
+    std::string bandName = "Ku-User";
 
-    // Target satellite — -1 means "auto-select closest"
     int32_t targetSatIndex = -1;
 
-    // Application
     uint16_t port     = 9;
-    uint32_t maxBytes = 100 * 1024 * 1024;   // 10 MB
-    uint32_t sendSize = 10 * 1024;
+    uint32_t maxBytes = 10 * 1024 * 1024;
+    uint32_t sendSize = 1024;
     double   duration = 300.0;
 
-    // Routing
     uint64_t ttlThresh   = 0;
     double   routeTimeout = 300.0;
 
-    // Debug
-    bool pcap          = false;
+    // [UPDATE-1] Adaptive rate update interval (seconds)
+    double   rateInterval = 10.0;
+
+    bool pcap = false;
+
+    // [UPDATE-3] Beamforming gain (dB), overrides band default
+    // 0 = no beamforming, 6 = 2x2 array, 12 = 4x4 array, 18 = 8x8 array
+    double bfGainDb = 0.0;
 
     // ========================================================================
     // 2. Parse command line
@@ -359,18 +488,52 @@ main (int argc, char *argv[])
     cmd.AddValue ("uavLat",          "UAV latitude  (degrees N)",              uavLatDeg);
     cmd.AddValue ("uavLon",          "UAV longitude (degrees E)",              uavLonDeg);
     cmd.AddValue ("uavAlt",          "UAV altitude  (meters ASL)",             uavAltM);
-    cmd.AddValue ("constellation",   "LEO constellation preset name",          constellation);
+    cmd.AddValue ("band",            "Sat band: Ku-User|Ka-Gateway|Ka-User|S-band", bandName);
     cmd.AddValue ("targetSatIndex",  "Satellite index (-1 = auto-closest)",    targetSatIndex);
     cmd.AddValue ("maxBytes",        "Total bytes to send (0 = unlimited)",    maxBytes);
     cmd.AddValue ("sendSize",        "TCP segment size (bytes)",               sendSize);
     cmd.AddValue ("ttlThresh",       "AODV TTL threshold",                     ttlThresh);
     cmd.AddValue ("routeTimeout",    "AODV ActiveRouteTimeout (seconds)",      routeTimeout);
+    cmd.AddValue ("rateInterval",    "Adaptive rate update interval (seconds)", rateInterval);
+    cmd.AddValue ("bfGain",          "Beamforming gain in dB (0/6/12/18)",     bfGainDb);
     cmd.AddValue ("destOnly",        "ns3::aodv::RoutingProtocol::DestinationOnly");
     cmd.AddValue ("pcap",            "Enable PCAP packet capture",             pcap);
     cmd.Parse (argc, argv);
 
     // ========================================================================
-    // 3. Redirect stdout to trace file (optional)
+    // [UPDATE-2] 3. 選擇頻段參數
+    // ========================================================================
+
+    SatBandParams band;
+    if (bandName == "Ku-User")          band = BAND_KU_USER;
+    else if (bandName == "Ka-Gateway")  band = BAND_KA_GATEWAY;
+    else if (bandName == "Ka-User")     band = BAND_KA_USER;
+    else if (bandName == "S-band")      band = BAND_S;
+    else
+    {
+        std::cerr << "ERROR: unknown band '" << bandName
+                  << "'. Using Ku-User." << std::endl;
+        band = BAND_KU_USER;
+    }
+
+    // [UPDATE-3] 套用命令列指定的 beamforming gain（覆寫 band 預設值）
+    if (bfGainDb > 0.0)
+    {
+        band.bfGainDb = bfGainDb;
+    }
+
+    std::cerr << "Band: " << band.name << " (" << band.freqGHz << " GHz, BW="
+              << band.bandwidthGHz * 1000.0 << " MHz, elev cutoff="
+              << band.elevAngleDeg << " deg)"
+              << std::endl;
+    // [UPDATE-3] 顯示 beamforming 設定
+    if (band.bfGainDb > 0.0)
+    {
+        std::cerr << "[UPDATE-3] Beamforming gain: " << band.bfGainDb << " dB" << std::endl;
+    }
+
+    // ========================================================================
+    // 4. Redirect stdout (optional)
     // ========================================================================
 
     std::streambuf *coutbuf = std::cout.rdbuf ();
@@ -378,56 +541,30 @@ main (int argc, char *argv[])
     if (!traceFile.empty ())
     {
         out.open (traceFile);
-        if (out.is_open ())
-        {
-            std::cout.rdbuf (out.rdbuf ());
-        }
+        if (out.is_open ()) std::cout.rdbuf (out.rdbuf ());
     }
 
     // ========================================================================
-    // 4. Create LEO satellite constellation
+    // 5. Create LEO satellite constellation
     // ========================================================================
-    //
-    // LeoOrbit (height_km, inclination_deg, sats_per_plane, num_planes)
 
     LeoOrbitNodeHelper orbit;
     NodeContainer satellites;
-
     if (!orbitFile.empty ())
-    {
         satellites = orbit.Install (orbitFile);
-    }
     else
-    {
-        // Telesat-like: 1200 km, 53 deg incl, 22 sats/plane, 12 planes = 264 sats
         satellites = orbit.Install ({LeoOrbit (1200, 53, 22, 12)});
-    }
 
     uint32_t numSats = satellites.GetN ();
     std::cerr << "Created " << numSats << " LEO satellites" << std::endl;
 
     // ========================================================================
-    // 5. Create the main UAV node (cluster head)
+    // 6. Create the main UAV node
     // ========================================================================
-    //
-    // From the LEO module's perspective, the UAV is a ground-station node.
-    // LeoMockChannel classifies it as GND type and only allows GND<->SAT
-    // communication — exactly the uplink we need.
-    //
-    // Position MUST be in ECEF because LeoPropagationLossModel computes
-    // slant range and elevation angle from ECEF coordinates.
 
     NodeContainer uavNodes;
     uavNodes.Create (1);
     Ptr<Node> mainUav = uavNodes.Get (0);
-
-    // Install mobility: ConstantPositionMobilityModel (hovering UAV)
-    //
-    // For a flight path, replace with WaypointMobilityModel:
-    //   Ptr<WaypointMobilityModel> mob = CreateObject<WaypointMobilityModel>();
-    //   mob->AddWaypoint(Waypoint(Seconds(0),   GeoToEcef(24.80, 120.97, 300)));
-    //   mob->AddWaypoint(Waypoint(Seconds(60),  GeoToEcef(24.85, 121.00, 300)));
-    //   mainUav->AggregateObject(mob);
 
     MobilityHelper uavMobility;
     Ptr<ListPositionAllocator> uavPosAlloc = CreateObject<ListPositionAllocator> ();
@@ -437,93 +574,98 @@ main (int argc, char *argv[])
     uavMobility.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
     uavMobility.Install (uavNodes);
 
-    std::cerr << "UAV ECEF: (" << uavEcef.x << ", "
-              << uavEcef.y << ", " << uavEcef.z << ")" << std::endl;
     PrintUavPosition (mainUav);
 
     // ========================================================================
-    // 6. Auto-select the closest satellite to the UAV
+    // 7. Auto-select closest satellite
     // ========================================================================
-    //
-    // The previous version hard-coded targetSatIndex=0, which happened to be
-    // a satellite starting at (lat=53, lon=0) — over 9000 km from Taiwan.
-    // With 264 satellites spread across 12 orbital planes, there are usually
-    // several satellites much closer to any given ground position.
-    //
-    // This scan finds the satellite with the smallest Euclidean distance to
-    // the UAV and uses it as the BulkSend target.  It also prints the top-10
-    // closest satellites with their elevation angles so you can verify
-    // visibility.
 
-    uint32_t autoClosest = FindClosestSatellite (satellites, mainUav, 10);
-
+    uint32_t autoClosest = FindClosestSatellite (satellites, mainUav, 3);
     if (targetSatIndex < 0)
     {
-        // Auto-select
         targetSatIndex = (int32_t) autoClosest;
-        std::cerr << "\nAuto-selected target: Sat[" << targetSatIndex << "]" << std::endl;
     }
     else if ((uint32_t) targetSatIndex >= numSats)
     {
-        std::cerr << "WARNING: targetSatIndex=" << targetSatIndex
-                  << " out of range, using auto-closest Sat[" << autoClosest << "]"
-                  << std::endl;
         targetSatIndex = (int32_t) autoClosest;
     }
-
     Ptr<Node> targetSat = satellites.Get ((uint32_t) targetSatIndex);
+    std::cerr << "  Selected: Sat[" << targetSatIndex << "]" << std::endl;
 
     // ========================================================================
-    // 7. Set up UAV-to-LEO channel (link model)
+    // [UPDATE-2] 8. 計算 link budget 並設定 LEO channel
     // ========================================================================
     //
-    // LeoChannelHelper creates:
-    //   - LeoMockChannel:          GND <-> SAT channel (no GND<->GND)
-    //   - LeoPropagationLossModel: path loss + elevation-angle cutoff
-    //   - LeoMockNetDevice:        typed devices (GND or SAT)
+    // 策略：
+    //   1. 先用 SetConstellation() 載入一組 preset 作為 propagation loss 的基礎
+    //      （ElevationAngle, FSPL, AtmosphericLoss, LinkMargin 等參數由 preset 決定）
+    //   2. 用 UAV 到 target satellite 的實際斜距計算 FSPL → SNR → Shannon data rate
+    //   3. 用 public API (SetGndDeviceAttribute / SetSatDeviceAttribute) 覆寫 DataRate
+    //      為計算得到的 Shannon capacity
     //
-    // Constellation presets:
-    //   TelesatUser:    13.5 GHz, elev 40 deg, ~316 Mbps
-    //   TelesatGateway: 28.5 GHz, elev 20 deg, ~9.8 Gbps (needs 3.5m dish)
-    //   StarlinkUser:   12.0 GHz, elev 40 deg, ~316 Mbps
-    //   StarlinkGateway:29.5 GHz, elev 20 deg, ~9.8 Gbps
+    // 為什麼不直接呼叫 SetConstellationAttributes()？
+    //   因為它是 private method，只有 SetConstellation() 內部可以呼叫。
+    //   但 Device 的屬性 (TxPower, RxGain, DataRate 等) 可以透過 public API 覆寫。
+    //
+    // 注意：propagation loss model 的參數（ElevationAngle, FSPL 等）使用 preset 的值，
+    // 不會完全匹配我們從實際距離算出的 FSPL。這是可接受的近似：
+    // preset 的 FSPL 決定「是否能收到封包」（link feasibility），
+    // 而我們計算的 Shannon rate 決定「收到封包時的傳輸速率」。
 
+    Vector satPos = targetSat->GetObject<MobilityModel> ()->GetPosition ();
+    double initDistKm = EcefDistance (uavEcef, satPos) / 1000.0;
+    double initElevDeg = ComputeElevationAngle (uavEcef, satPos);
+
+    // 計算 link budget
+    double fsplDb = CalcFSPL (initDistKm, band.freqGHz);
+    double snrDb  = CalcSNR (band, initDistKm);
+    double shannonMbps = CalcShannonCapacity (band, snrDb);
+
+    // 印出完整 link budget
+    PrintLinkBudget (band, initDistKm, initElevDeg);
+
+    // 把 Shannon capacity 轉成 ns-3 data rate 字串 (e.g. "456.7Mbps")
+    std::ostringstream dataRateStr;
+    dataRateStr << std::fixed << std::setprecision(1) << shannonMbps << "Mbps";
+
+    std::cerr << "[UPDATE-2] Computed data rate: " << dataRateStr.str () << std::endl;
     LeoChannelHelper utCh;
-    utCh.SetConstellation (constellation);
+    if (band.freqGHz > 20.0)
+        utCh.SetConstellation ("TelesatGateway");   // Ka-band → TelesatGateway preset
+    else
+        utCh.SetConstellation ("TelesatUser");       // Ku/S-band → TelesatUser preset
 
-    // Install channel between ALL satellites and the UAV node.
-    // LeoMockChannel internally decides per-packet whether the destination
-    // satellite is within the elevation-angle window.
+    // [UPDATE-2] Step 2: 用 public API 覆寫 DataRate 為 Shannon 計算值
+    utCh.SetGndDeviceAttribute ("DataRate", StringValue (dataRateStr.str ()));
+    utCh.SetSatDeviceAttribute ("DataRate", StringValue (dataRateStr.str ()));
+
+    // [UPDATE-2] Step 3: 覆寫 TxPower 和 RxGain 以匹配所選頻段
+    utCh.SetGndDeviceAttribute ("TxPower", DoubleValue (band.eirpDbm));
+    utCh.SetSatDeviceAttribute ("TxPower", DoubleValue (band.eirpDbm));
+    utCh.SetGndDeviceAttribute ("RxGain",  DoubleValue (band.rxGainDbi));
+    utCh.SetSatDeviceAttribute ("RxGain",  DoubleValue (band.rxGainDbi));
+
     NetDeviceContainer utNet = utCh.Install (satellites, uavNodes);
 
-    std::cerr << "LEO channel: constellation=" << constellation
-              << ", " << utNet.GetN () << " devices" << std::endl;
-
     // ========================================================================
-    // 8. Install Internet stack with AODV routing
+    // 9. Install Internet stack with AODV
     // ========================================================================
-    //
-    // AODV handles dynamic route discovery as satellites orbit overhead.
-    //   - EnableHello=false: HELLO broadcasts unreliable over satellite.
-    //   - ActiveRouteTimeout=300s: matches ~5 min LEO pass duration.
 
     InternetStackHelper stack;
     AodvHelper aodv;
     aodv.Set ("EnableHello", BooleanValue (false));
     aodv.Set ("ActiveRouteTimeout", TimeValue (Seconds (routeTimeout)));
-
     if (ttlThresh != 0)
     {
         aodv.Set ("TtlThreshold", UintegerValue (ttlThresh));
         aodv.Set ("NetDiameter",  UintegerValue (2 * ttlThresh));
     }
-
     stack.SetRoutingHelper (aodv);
     stack.Install (satellites);
     stack.Install (uavNodes);
 
     // ========================================================================
-    // 9. Assign IP addresses
+    // 10. Assign IP addresses
     // ========================================================================
 
     Ipv4AddressHelper ipv4;
@@ -531,61 +673,26 @@ main (int argc, char *argv[])
     Ipv4InterfaceContainer utIf = ipv4.Assign (utNet);
 
     // ========================================================================
-    // 10. Resolve the target satellite's IP address
+    // 11. Resolve target satellite IP
     // ========================================================================
 
     Ipv4Address targetAddr = targetSat->GetObject<Ipv4> ()
                                  ->GetAddress (1, 0).GetLocal ();
 
-    std::cerr << "UAV  node ID = " << mainUav->GetId () << std::endl;
-    std::cerr << "Target Sat[" << targetSatIndex
-              << "] node ID = " << targetSat->GetId ()
-              << ", IP = " << targetAddr << std::endl;
-
-    // Verify the initial elevation angle to the target
-    {
-        Vector satPos = targetSat->GetObject<MobilityModel> ()->GetPosition ();
-        double dist = EcefDistance (uavEcef, satPos);
-        double elev = ComputeElevationAngle (uavEcef, satPos);
-        std::cerr << "Initial link: dist=" << dist / 1000.0
-                  << " km, elev=" << elev << " deg";
-        if (elev >= 40.0)
-            std::cerr << " [VISIBLE with TelesatUser]" << std::endl;
-        else if (elev >= 20.0)
-            std::cerr << " [VISIBLE with TelesatGateway only]" << std::endl;
-        else
-            std::cerr << " [NOT VISIBLE — connection may fail!]" << std::endl;
-    }
-
     // ========================================================================
-    // 11. Install TCP BulkSendApplication on the UAV (sender)
+    // 12. Install BulkSend on UAV (sender)
     // ========================================================================
 
     BulkSendHelper sender ("ns3::TcpSocketFactory",
                            InetSocketAddress (targetAddr, port));
     sender.SetAttribute ("MaxBytes", UintegerValue (maxBytes));
     sender.SetAttribute ("SendSize", UintegerValue (sendSize));
-
     ApplicationContainer sourceApps = sender.Install (mainUav);
-    // CRITICAL: Start at t=0.0 so the TCP socket exists when Config::Connect
-    // runs at t=1e-7.  Starting at t=1.0 means the socket doesn't exist yet
-    // → UAV Tx is never traced → no delay data.  (Same as calculate-delay.cc)
     sourceApps.Start (Seconds (0.0));
 
     // ========================================================================
-    // 12. Install PacketSink on ALL satellites
+    // 13. Install PacketSink on ALL satellites
     // ========================================================================
-    //
-    // KEY FIX: Instead of installing PacketSink on only one satellite,
-    // we install it on ALL satellites.  This way:
-    //   - If AODV routes to the target satellite and it's visible, data flows.
-    //   - If the target satellite moves out of range during the simulation,
-    //     and another satellite enters range, AODV can potentially re-route
-    //     (though BulkSend's TCP connection is bound to the target IP).
-    //
-    // For the primary data flow, the BulkSend connects to targetAddr.
-    // PacketSink on other satellites is a safety net for future extensions
-    // (e.g., anycast-style routing or multiple TCP connections).
 
     ApplicationContainer sinkApps;
     PacketSinkHelper sinkHelper ("ns3::TcpSocketFactory",
@@ -595,37 +702,31 @@ main (int argc, char *argv[])
         ApplicationContainer app = sinkHelper.Install (satellites.Get (i));
         app.Start (Seconds (0.0));
         if (i == (uint32_t) targetSatIndex)
-        {
-            sinkApps.Add (app);  // Track the target's sink for results
-        }
+            sinkApps.Add (app);
     }
 
     // ========================================================================
-    // 13. Connect TCP trace sources for delay measurement
+    // 14. Connect traces
     // ========================================================================
 
     Simulator::Schedule (Seconds (1e-7), &connect);
 
     // ========================================================================
-    // 14. Schedule periodic monitoring
+    // 15. Periodic monitoring — adaptive rate updates only
     // ========================================================================
+    // PrintUavSatDistance and PrintClosestSatellites removed to reduce clutter.
+    // All distance/elev/SNR/rate info is in the Adaptive Rate Log table.
 
-    // Print distance + elevation to target satellite every 30s
-    for (int t = 0; t <= (int) duration; t += 30)
+    // [UPDATE-1] 定期更新 adaptive data rate
+    for (double t = rateInterval; t <= duration; t += rateInterval)
     {
-        Simulator::Schedule (Seconds (t), &PrintUavSatDistance,
-                             mainUav, targetSat, (uint32_t) targetSatIndex);
-    }
-
-    // Re-scan for closest satellite every 60s (informational)
-    for (int t = 60; t <= (int) duration; t += 60)
-    {
-        Simulator::Schedule (Seconds (t), &PrintClosestSatellites,
-                             satellites, mainUav, 5);
+        Simulator::Schedule (Seconds (t), &UpdateAdaptiveRate,
+                             mainUav, targetSat, utNet, band,
+                             (uint32_t) targetSatIndex);
     }
 
     // ========================================================================
-    // 15. Enable PCAP tracing (optional)
+    // 16. PCAP (optional)
     // ========================================================================
 
     if (pcap)
@@ -636,17 +737,13 @@ main (int argc, char *argv[])
     }
 
     // ========================================================================
-    // 16. Run simulation
+    // 17. Run simulation
     // ========================================================================
 
-    std::cerr << "\n=== Starting simulation ==="
-              << "\n  Duration:      " << duration << "s"
-              << "\n  MaxBytes:      " << maxBytes
-              << "\n  Constellation: " << constellation
-              << "\n  Target:        Sat[" << targetSatIndex << "] IP=" << targetAddr
-              << "\n  UAV position:  (" << uavLatDeg << "N, " << uavLonDeg << "E, "
-              << uavAltM << "m)"
-              << "\n=========================" << std::endl;
+    std::cerr << "\n=== Simulation: " << duration << "s, "
+              << band.name << ", rate=" << dataRateStr.str ()
+              << ", Sat[" << targetSatIndex << "], "
+              << "adaptive interval=" << rateInterval << "s ===" << std::endl;
 
     NS_LOG_INFO ("Run Simulation.");
     Simulator::Stop (Seconds (duration));
@@ -655,72 +752,94 @@ main (int argc, char *argv[])
     NS_LOG_INFO ("Done.");
 
     // ========================================================================
-    // 17. Output results
+    // 18. Output results
     // ========================================================================
 
     Ptr<PacketSink> pktSink = DynamicCast<PacketSink> (sinkApps.Get (0));
     uint64_t totalRx = pktSink->GetTotalRx ();
 
     std::cout << "\n========== UAV-to-LEO Simulation Results ==========" << std::endl;
-    std::cout << "UAV node:       " << mainUav->GetId () << std::endl;
-    std::cout << "Target Sat[" << targetSatIndex << "]: node "
+    std::cout << "UAV node " << mainUav->GetId ()
+              << " -> Sat[" << targetSatIndex << "] node "
               << targetSat->GetId () << " (IP " << targetAddr << ")" << std::endl;
-    std::cout << "Constellation:  " << constellation << std::endl;
-    std::cout << "Duration:       " << duration << " s" << std::endl;
-    std::cout << "Bytes requested:" << maxBytes << std::endl;
-    std::cout << "Bytes received: " << totalRx << std::endl;
+    std::cout << "Band:           " << band.name
+              << " (" << band.freqGHz << " GHz, BW=" << band.bandwidthGHz * 1000.0 << " MHz)" << std::endl;
 
-    // Throughput
-    if (duration > 0)
+    // [UPDATE-3] 顯示 beamforming gain
+    if (band.bfGainDb > 0.0)
     {
-        double throughputKbps = (totalRx * 8.0) / (duration * 1e3);
-        double throughputMbps = throughputKbps / 1e3;
-        std::cout << "Avg throughput: " << throughputKbps << " kbps ("
-                  << throughputMbps << " Mbps)" << std::endl;
-    }
-
-    // Debug diagnostics to cerr (always visible on terminal)
-    std::cerr << "\n[DEBUG] EchoTxRx was called " << g_traceCallCount << " times" << std::endl;
-    std::cerr << "[DEBUG] TxTimes entries: " << TxTimes.size () << std::endl;
-    std::cerr << "[DEBUG] delay entries:   " << delay.size () << std::endl;
-
-    // End-to-end delay — same output pattern as calculate-delay.cc
-    if (!delay.empty ())
-    {
-        double totalDelay = 0.0, minDelay = 1e9, maxDelay = 0.0;
-        double nums = 0;
-
-        for (auto &[uid, d] : delay)
-        {
-            totalDelay += d;
-            nums += 1;
-            if (d < minDelay) minDelay = d;
-            if (d > maxDelay) maxDelay = d;
-        }
-        double avgDelay = totalDelay / nums;
-
-        std::cout << "Packets measured:  " << (int) nums << std::endl;
-        std::cout << "Avg delay:         " << avgDelay * 1000.0 << " ms" << std::endl;
-        std::cout << "Min delay:         " << minDelay * 1000.0 << " ms" << std::endl;
-        std::cout << "Max delay:         " << maxDelay * 1000.0 << " ms" << std::endl;
-        cout << "Packet average end-to-end delay is " << avgDelay << "s" << endl;
+        std::cout << "Beamforming:    +" << band.bfGainDb << " dB  [UPDATE-3]" << std::endl;
     }
     else
     {
-        std::cout << "\nWARNING: No delay measurements collected." << std::endl;
-        std::cout << "Check the elevation angles printed above." << std::endl;
-        std::cout << "If all say '[below cutoff]', try:" << std::endl;
-        std::cout << "  --constellation=TelesatGateway  (20 deg cutoff)" << std::endl;
-        std::cout << "  --duration=600                  (longer window)" << std::endl;
+        std::cout << "Beamforming:    none (0 dB)" << std::endl;
+    }
+
+    // *** Highlight: this is the parameter that decides LINK DOWN ***
+    // It comes from SatBandParams::elevAngleDeg, which is set per frequency band.
+    // - Ku-User:    40 deg  (from Telesat user link spec)
+    // - Ka-Gateway: 20 deg  (from Telesat gateway link spec)
+    // - Ka-User:    30 deg  (estimated for UAV Ka terminal)
+    // - S-band:     20 deg  (typical for S-band links)
+    // The LEO module's LeoPropagationLossModel also enforces this via its
+    // "ElevationAngle" attribute (set by SetConstellation), which drops packets
+    // when the satellite is below this angle from the ground node's horizon.
+    std::cout << "Elev cutoff:    " << band.elevAngleDeg
+              << " deg  <-- decides LINK DOWN (from " << band.name << " band spec)" << std::endl;
+
+    std::cout << "Init link:      dist=" << std::fixed << std::setprecision(1)
+              << initDistKm << " km, elev=" << initElevDeg
+              << " deg, FSPL=" << fsplDb << " dB, SNR=" << snrDb
+              << " dB, rate=" << shannonMbps << " Mbps" << std::endl;
+    std::cout << "Duration:       " << duration << " s" << std::endl;
+    std::cout << "Bytes:          " << totalRx << " / " << maxBytes << " received" << std::endl;
+
+    if (duration > 0)
+    {
+        double throughputMbps = (totalRx * 8.0) / (duration * 1e6);
+        std::cout << "Avg throughput: " << throughputMbps << " Mbps" << std::endl;
+    }
+
+    if (!delay.empty ())
+    {
+        double totalDelay = 0.0, minDelay = 1e9, maxDelay = 0.0, nums = 0;
+        for (auto &[uid, d] : delay)
+        {
+            totalDelay += d; nums += 1;
+            if (d < minDelay) minDelay = d;
+            if (d > maxDelay) maxDelay = d;
+        }
+        std::cout << "Delay:          avg=" << (totalDelay / nums) * 1000.0
+                  << " ms, min=" << minDelay * 1000.0
+                  << " ms, max=" << maxDelay * 1000.0
+                  << " ms (" << (int) nums << " pkts)" << std::endl;
+    }
+
+    // [UPDATE-1] Adaptive Rate Log — single compact table
+    if (!g_rateLog.empty ())
+    {
+        std::cout << "\n--- Adaptive Rate Log (interval=" << rateInterval << "s) ---" << std::endl;
+        std::cout << "  Time   Dist(km)   Elev    SNR    Rate(Mbps)  Status" << std::endl;
+        for (auto &r : g_rateLog)
+        {
+            bool down = (r.elevDeg < band.elevAngleDeg);
+            std::cout << std::fixed << std::setprecision(1)
+                      << std::setw(6) << r.timeSec << "s"
+                      << std::setw(10) << r.distKm
+                      << std::setw(8) << r.elevDeg << "°"
+                      << std::setw(7) << r.snrDb << " dB"
+                      << std::setw(11) << r.rateMbps
+                      << "  " << (down ? "[DOWN <" : "[OK   >=")
+                      << band.elevAngleDeg << "°]"
+                      << std::endl;
+        }
     }
     std::cout << "=====================================================" << std::endl;
 
-    // Restore stdout
     if (out.is_open ())
     {
         out.close ();
         std::cout.rdbuf (coutbuf);
     }
-
     return 0;
 }
