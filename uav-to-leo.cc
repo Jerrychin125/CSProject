@@ -636,6 +636,62 @@ EchoTxRx (std::string context,
     //           << ":" << header.GetSequenceNumber () << std::endl;
 }
 
+// ============================================================================
+// [UPDATE-4] Effective throughput measurement (application-layer hooks)
+// ============================================================================
+// 教授指示：data rate (Shannon capacity) 是理論上限，實際 throughput 受
+//   header / ACK / idle gap / TCP ramp-up 影響，必須由實測得出。
+//
+//   effective throughput = totalRxBytes * 8 / (lastRxSec - firstTxSec)
+//
+// firstTxSec : BulkSend 第一次把 segment 推進 TCP socket buffer 的時刻
+// lastRxSec  : PacketSink 收到最後一段 application payload 的時刻
+// 區間內天然包含了 header overhead、TCP 等待、ACK 往返等所有「非純資料」時間。
+
+struct ThroughputRecord
+{
+    double   firstTxSec  = -1.0;
+    double   firstRxSec  = -1.0;
+    double   lastRxSec   = -1.0;
+    uint64_t totalTxBytes = 0;
+    uint64_t totalRxBytes = 0;
+};
+static ThroughputRecord g_tput;
+
+// fixed-volume 模式：收到 g_volumeBytes 後立即停止模擬
+static bool     g_fixedVolume = false;
+static uint64_t g_volumeBytes = 0;
+static bool     g_stopFired   = false;
+
+// BulkSend Tx trace：每次 application 將一段 sendSize 推進 socket
+static void
+AppTxTrace (Ptr<const Packet> p)
+{
+    double now = Simulator::Now ().GetSeconds ();
+    if (g_tput.firstTxSec < 0.0)
+        g_tput.firstTxSec = now;
+    g_tput.totalTxBytes += p->GetSize ();
+}
+
+// PacketSink Rx trace：每次 sink 收到一段 TCP payload
+static void
+AppRxTrace (Ptr<const Packet> p, const Address &/*from*/)
+{
+    double now = Simulator::Now ().GetSeconds ();
+    if (g_tput.firstRxSec < 0.0)
+        g_tput.firstRxSec = now;
+    g_tput.lastRxSec = now;
+    g_tput.totalRxBytes += p->GetSize ();
+
+    // [UPDATE-4] fixed-volume mode: stop sim once target bytes are received
+    if (g_fixedVolume && !g_stopFired
+        && g_tput.totalRxBytes >= g_volumeBytes)
+    {
+        g_stopFired = true;
+        Simulator::Stop ();   // 立刻停止
+    }
+}
+
 void
 connect ()
 {
@@ -643,6 +699,14 @@ connect ()
                      MakeCallback (&EchoTxRx));
     Config::Connect ("/NodeList/*/$ns3::TcpL4Protocol/SocketList/*/Rx",
                      MakeCallback (&EchoTxRx));
+
+    // [UPDATE-4] 新增：application 層 (effective throughput)
+    Config::ConnectWithoutContext (
+        "/NodeList/*/ApplicationList/*/$ns3::BulkSendApplication/Tx",
+        MakeCallback (&AppTxTrace));
+    Config::ConnectWithoutContext (
+        "/NodeList/*/ApplicationList/*/$ns3::PacketSink/Rx",
+        MakeCallback (&AppRxTrace));
 }
 
 // ============================================================================
@@ -852,6 +916,9 @@ main (int argc, char *argv[])
     int nAnt = 16;
     int nRF  = 4;
 
+    // [UPDATE-4] Throughput measurement mode
+    bool fixedVolume = false;   // true = stop on receiving maxBytes
+
     // ========================================================================
     // 2. Parse command line
     // ========================================================================
@@ -876,7 +943,13 @@ main (int argc, char *argv[])
     cmd.AddValue ("nRF",             "Number of RF chains (hybrid: nRF <= nAnt)", nRF);
     cmd.AddValue ("destOnly",        "ns3::aodv::RoutingProtocol::DestinationOnly");
     cmd.AddValue ("pcap",            "Enable PCAP packet capture",             pcap);
+    cmd.AddValue ("fixedVolume",     "Stop simulation when maxBytes received "
+                                     "(false = fixed duration)",   fixedVolume);
     cmd.Parse (argc, argv);
+
+    // [UPDATE-4] 把 CLI flag 同步到 trace callback 用的 globals
+    g_fixedVolume = fixedVolume;
+    g_volumeBytes = maxBytes;
 
     // ========================================================================
     // [UPDATE-2] 3. 選擇頻段參數
@@ -1201,7 +1274,7 @@ main (int argc, char *argv[])
     std::cout << "Init link:      dist=" << std::fixed << std::setprecision(1)
               << initDistKm << " km, elev=" << initElevDeg
               << " deg, FSPL=" << fsplDb << " dB, SNR=" << snrDb
-              << " dB, rate=" << shannonMbps << " Mbps" << std::endl;
+              << " dB, Shannon=" << shannonMbps << " Mbps" << std::endl;
     std::cout << "Duration:       " << duration << " s" << std::endl;
     std::cout << "Bytes:          " << totalRx << " / " << maxBytes << " received" << std::endl;
 
@@ -1246,6 +1319,73 @@ main (int argc, char *argv[])
                       << std::endl;
         }
     }
+
+    // ========================================================================
+    // [UPDATE-4] Effective throughput measurement results
+    // ========================================================================
+    std::cout << "\n--- Effective Throughput Measurement ---" << std::endl;
+    std::cout << "Mode:                "
+              << (g_fixedVolume ? "fixed-volume (stop on maxBytes)"
+                                : "fixed-time (run full duration)")
+              << std::endl;
+
+    if (g_tput.firstTxSec >= 0.0
+        && g_tput.lastRxSec  >  g_tput.firstTxSec
+        && g_tput.totalRxBytes > 0)
+    {
+        double measSec = g_tput.lastRxSec - g_tput.firstTxSec;
+        double effMbps = (g_tput.totalRxBytes * 8.0) / (measSec * 1e6);
+
+        std::cout << std::fixed;
+        std::cout << "Total Tx bytes:      " << g_tput.totalTxBytes << std::endl;
+        std::cout << "Total Rx bytes:      " << g_tput.totalRxBytes << std::endl;
+        std::cout << "First Tx time:       " << std::setprecision(6)
+                                              << g_tput.firstTxSec << " s" << std::endl;
+        std::cout << "Last  Rx time:       " << g_tput.lastRxSec  << " s" << std::endl;
+        std::cout << "Measured duration:   " << std::setprecision(3)
+                                              << measSec * 1000.0 << " ms" << std::endl;
+        std::cout << "Effective throughput:" << std::setprecision(3)
+                                              << effMbps << " Mbps" << std::endl;
+
+        // [UPDATE-4 fix] Shannon reference must come from the *transmission window*,
+        // not the end of simulation. For a typical 10 MB transfer (~0.7s) the window
+        // is shorter than rateInterval (10s), so g_rateLog has no entry inside it
+        // → fall back to the pre-sim initial Shannon (shannonMbps, t=0).
+        // For longer transfers spanning multiple adaptive updates, average the
+        // valid (non-DOWN) entries that fall inside [firstTxSec, lastRxSec].
+        double shannonRef = shannonMbps;
+        {
+            double sum = 0.0;
+            int    count = 0;
+            for (auto &r : g_rateLog)
+            {
+                if (r.timeSec >= g_tput.firstTxSec
+                    && r.timeSec <= g_tput.lastRxSec
+                    && r.rateMbps > 0.001)        // skip link-DOWN entries
+                {
+                    sum += r.rateMbps;
+                    count++;
+                }
+            }
+            if (count > 0) shannonRef = sum / count;
+        }
+
+        if (shannonRef > 0.0)
+        {
+            std::cout << "Shannon (theoretical):"
+                      << std::setprecision(3) << shannonRef << " Mbps" << std::endl;
+            std::cout << "Efficiency (eff/Shannon): "
+                      << std::setprecision(1) << (effMbps / shannonRef * 100.0)
+                      << " %" << std::endl;
+        }
+    }
+    else
+    {
+        std::cout << "No effective Tx/Rx recorded "
+                  << "(link may have been DOWN, or sim ended too early)."
+                  << std::endl;
+    }
+
     std::cout << "=====================================================" << std::endl;
 
     if (out.is_open ())
