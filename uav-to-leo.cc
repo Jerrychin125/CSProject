@@ -19,6 +19,24 @@
  *   這正確表達「主瓣對準衛星、N 支天線建設性干涉」的物理效應，
  *   讓 BF gain 真正提升 SNR（峰值約 +15 dB at N=16），而非舊版 broadside-only
  *   pattern 帶來的負增益問題。
+ *
+ * [UPDATE-4] Effective throughput measurement (application-layer Tx/Rx hooks).
+ *   - 教授指示：data rate (Shannon capacity) 是理論上限，實測 throughput 受
+ *     header / ACK / idle gap / TCP ramp-up 影響。
+ *   - 用 BulkSend Tx + PacketSink Rx 兩個 application-layer trace 計算
+ *     effective throughput = totalRxBytes × 8 / (lastRxSec − firstTxSec)。
+ *   - 新增 --fixedVolume 模式：收到 maxBytes 立刻 Simulator::Stop()，
+ *     測「傳完一定資料量需要多久」。
+ *
+ * [UPDATE-5] TCP receive-window unblock + sensible defaults.
+ *   - 預設 ns-3 TcpSocket RcvBufSize=128KB，搭配 ~8ms RTT 會把 TCP throughput
+ *     夾在 128KB×8/8ms ≈ 128 Mbps，導致 BF 提升的物理頻寬完全反映不到應用層
+ *     （無論 Shannon 是 2.1G 還是 2.4G，effective throughput 都卡在 ~127 Mbps）。
+ *     這裡把 SndBufSize/RcvBufSize 拉到 8 MB（足以裝下 ~2.5 MB BDP），
+ *     SegmentSize 拉到 1448 (一般 Ethernet MSS)，讓 BF 增益真的被 TCP 用到。
+ *   - 預設 fixedVolume=true、bpFile=contrib/leo/examples/beam_pattern.csv，
+ *     不需傳任何參數即走「CSV beamforming + 收到 maxBytes 立即停止」的
+ *     量測路徑；wallclock 從 ~1 分鐘降到數秒。
  */
 
 #include <iostream>
@@ -905,9 +923,7 @@ main (int argc, char *argv[])
     bool pcap = false;
 
     // [UPDATE-3] Beamforming parameters
-    std::string bpFile;    // MATLAB beam pattern CSV file path (empty = use fallback)
-    // int nAnt = 16;         // 天線元素數（例如 16 = 4×4 UPA），--nAnt 可覆寫
-    // int nRF  = 4;          // RF chain 數（hybrid: nRF < nAnt），--nRF 可覆寫
+    std::string bpFile;
 
     // [UPDATE-3] Hybrid beamforming: antenna array configuration
     // nAnt = total antenna elements (e.g. 16 for 4x4 UPA)
@@ -917,7 +933,10 @@ main (int argc, char *argv[])
     int nRF  = 4;
 
     // [UPDATE-4] Throughput measurement mode
-    bool fixedVolume = false;   // true = stop on receiving maxBytes
+    // [UPDATE-5] Default true: stop sim once maxBytes received (avoids wasting wallclock
+    // on idle satellite mobility / AODV after transfer completes). Pass --fixedVolume=false
+    // to run the full duration and observe satellite trajectory in the Adaptive Rate Log.
+    bool fixedVolume = true;
 
     // ========================================================================
     // 2. Parse command line
@@ -944,12 +963,35 @@ main (int argc, char *argv[])
     cmd.AddValue ("destOnly",        "ns3::aodv::RoutingProtocol::DestinationOnly");
     cmd.AddValue ("pcap",            "Enable PCAP packet capture",             pcap);
     cmd.AddValue ("fixedVolume",     "Stop simulation when maxBytes received "
-                                     "(false = fixed duration)",   fixedVolume);
+                                     "(default true; pass false to run full duration)",
+                                     fixedVolume);
     cmd.Parse (argc, argv);
 
     // [UPDATE-4] 把 CLI flag 同步到 trace callback 用的 globals
     g_fixedVolume = fixedVolume;
     g_volumeBytes = maxBytes;
+
+    // ========================================================================
+    // [UPDATE-5] TCP buffer & segment defaults
+    // ========================================================================
+    // 預設 ns-3 TcpSocket 的 SndBufSize / RcvBufSize 都是 128 KB，搭配本場景
+    // 約 8 ms 的 RTT，TCP throughput 上限 = 128KB × 8 / 8ms ≈ 128 Mbps。
+    // 這會讓 BF 提升的物理頻寬（Shannon 從 2.1G 升到 2.4G）完全反映不到
+    // application 層 — effective throughput 永遠卡在 ~127 Mbps，看起來像
+    // 「BF 沒生效」。
+    //
+    // 解決：把 buffer 拉到 8 MB（足以裝下 ~2.5 MB 的 BDP），讓 TCP cwnd 能
+    // 漲到對應 Shannon rate 的 in-flight bytes，BF 的物理增益才會真的轉成
+    // 應用層 throughput 提升。
+    //
+    // 同時把 SegmentSize 從預設的 536 bytes 拉到 1448（ethernet MSS），
+    // 讓每個 segment 的 TCP/IP header overhead 比例從 ~7% 降到 ~3%。
+    //
+    // 注意：Config::SetDefault 必須在 InternetStackHelper::Install 之前呼叫，
+    // 否則新建立的 TcpSocket 會用舊的預設值。
+    Config::SetDefault ("ns3::TcpSocket::SndBufSize", UintegerValue (8 * 1024 * 1024));
+    Config::SetDefault ("ns3::TcpSocket::RcvBufSize", UintegerValue (8 * 1024 * 1024));
+    // Config::SetDefault ("ns3::TcpSocket::SegmentSize", UintegerValue (1448));
 
     // ========================================================================
     // [UPDATE-2] 3. 選擇頻段參數
